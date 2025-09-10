@@ -50,10 +50,10 @@ class BaseLLM:
             yield ("" if i == 0 else " ") + ch
 
 class EchoLLM(BaseLLM):
-    """一个演示模型：把最后一条 user 内容回声返回。换成你自己的模型即可。"""
+    """A dummy LLM that just echoes the last user message."""
     async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
         last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        await asyncio.sleep(0)  # 让出事件循环
+        await asyncio.sleep(0)  # Yield control
         return f"[echo] {last_user}"
 
 # ========= Small utilities (no external files) =========
@@ -256,10 +256,10 @@ class ToolRegistry:
 class SimpleRuntime:
     """
     extreme simple pipeline：
-    1) 前处理(可选)
-    2) 调 LLM
-    3) 解析动作(可选) / 再次调 LLM(可选)
-    4) 输出过滤
+    1) pre-processing(optional,not yet)
+    2) call LLM
+    3) Analysis tool/action (optional) / call LLM (optional)
+    4) Output filtering
     """
     def __init__(self, config: RailsConfig, llm: BaseLLM,
                  filters: Dict[str, BaseFilter],
@@ -270,11 +270,11 @@ class SimpleRuntime:
         self.tools = tools
 
     async def run_once(self, messages: List[Dict[str, str]], context: Dict[str, Any]) -> str:
-        # 1) 前处理（示例略）
-        # 2) 调 LLM
+        # 1) pre-processing(optional,not yet)
+        # 2) call LLM
         output = await self.llm.acomplete(messages)
 
-        # 3) 解析工具/动作（可选示例：如果输出中包含 {{tool:name json}} 结构）
+        # 3) Analysis tool/action (optional example: if the output contains the {{tool:name json}} structure)
         if self.config.tools_enabled and "{{tool:" in output:
             try:
                 name, payload = self._parse_tool_call(output)
@@ -285,17 +285,17 @@ class SimpleRuntime:
             except Exception as e:
                 output = f"{output}\n\n(tool error) {e}"
 
-        # 4) 输出过滤（顺序执行）
+        # 4) Output filtering (sequential execution)
         allowed, reason, out = self._apply_filters(output, context)
         if not allowed:
-            # 你可以选择截断/替换/报错。这里返回原因与被动截断文本。
+            # can choose to truncate/replace/report an error. Here are the reasons and the text that was passively truncated.
             return f"[blocked] {reason}\n{out}"
         return out
 
     async def run_stream(self, messages: List[Dict[str, str]], context: Dict[str, Any]) -> AsyncIterator[str]:
         """
-        流式输出时，同样需要在每个 chunk 上应用过滤器。
-        为避免半个词误判，做一个简单的按空白分词的缓冲。
+        When streaming output, it is also necessary to apply filters to each chunk. 
+        To avoid misjudging half a word, create a simple buffer based on whitespace for tokenization.
         """
         buffer_text = ""
         async for chunk in self.llm.astream(messages):
