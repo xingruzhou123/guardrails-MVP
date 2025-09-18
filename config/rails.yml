@@ -1,0 +1,19 @@
+# this file is for users to define their own custom settings# This file defines the safety rails for the application.
+# It's a "Colang alternative" that separates configuration from code.
+
+output_rails:
+  - name: "Block Sensitive AMD Info"
+    type: "regex"
+    description: "Blocks output containing both an AMD product and a sensitive micro-architectural term."
+    # The first list of patterns identifies the brand/product.
+    # The second list identifies the sensitive terms.
+    # The rule will trigger if a match is found from BOTH lists.
+    patterns:
+      - "(?i)\\b(amd|zen\\d?|ryzen|epyc|rdna|cdna)\\b"
+      - "(?i)(micro-?architecture|branch-?predictor|l[123]-?cache|rtl|verilog|die-?shot|floorplan)"
+
+  - name: "External Moderation Service"
+    type: "http"
+    description: "Calls the external Flask app for a safety verdict."
+    endpoint: "http://127.0.0.1:5000/moderate" # Assuming your app.py runs on port 5000
+    on_fail: "allow" # What to do on a network error: "allow" or "block"
