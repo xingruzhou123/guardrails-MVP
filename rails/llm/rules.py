@@ -118,7 +118,7 @@ class BlockSensitiveAMDInfo(RegexRule):
         super().__init__(
             name="Block Sensitive AMD Info",
             patterns=[
-                r"(AMD|Ryzen|Zen\s*\d+)",  # product pattern
-                r"(branch\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\s*table)"  # sensitive pattern
+                r"(AMD|Ryzen|Zen\s*\d+)",
+                r"(branch\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\s*table)"
             ]
         )

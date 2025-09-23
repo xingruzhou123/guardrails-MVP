@@ -12,7 +12,7 @@ import yaml
 from rails.llm.hf_llm import HFChatLLM 
 import os, sys
 from rails.llm.utils import to_chat_text, run_blocking
-from rails.llm.rules import BaseOutputRule, RegexRule, LLMCheckRule, OutputRuleResult
+from rails.llm.rules import BaseOutputRule, RegexRule, LLMCheckRule,BlockSensitiveAMDInfo, OutputRuleResult
 from .rule_base import BaseOutputRule, OutputRuleResult
 
 # ========= Config (dataclasses must come early; define only once) ============
@@ -46,11 +46,13 @@ class BaseLLM:
     async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
         raise NotImplementedError
 
-    async def astream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncIterator[str]:
-        text = await self.acomplete(messages, **kwargs)
-        for i, ch in enumerate(text.split()):
-            yield ("" if i == 0 else " ") + ch
-        await asyncio.sleep(0) # Yield control
+    async def astream(self, messages: List[Dict[str, str]], **kwargs):
+        raise NotImplementedError
+
+    async def aclose(self):
+        # No-op by default
+        return
+
 
 class EchoLLM(BaseLLM):
     async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
@@ -76,114 +78,36 @@ async def run_blocking(func, *args, loop=None, **kwargs):
     loop = loop or asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
-# ========= Hugging Face Adapter (Instella-ready) =============================
-# class HFChatLLM(BaseLLM):
-#     def __init__(
-#         self,
-#         model_name: str = "amd/Instella-3B",
-#         device_map: Any = "auto",
-#         dtype: Optional[str] = None,
-#         trust_remote_code: bool = True,
-#         attn_implementation: Optional[str] = None,
-#         max_new_tokens: int = 512,
-#         temperature: float = 0.7,
-#         top_p: float = 0.9,
-#         repetition_penalty: float = 1.05,
-#     ):
-#         try:
-#             import torch
-#             from transformers import (
-#                 AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, GenerationConfig
-#             )
-#         except Exception as e:
-#             raise RuntimeError("HFChatLLM requires 'torch' and 'transformers' to be installed.") from e
-
-#         torch_dtype = None
-#         if dtype:
-#             d = dtype.lower()
-#             if d == "bfloat16":
-#                 torch_dtype = torch.bfloat16
-#             elif d in ("float16", "fp16", "half"):
-#                 torch_dtype = torch.float16
-
-#         self._torch = torch
-#         self._TextIteratorStreamer = TextIteratorStreamer
-#         self._GenerationConfig = GenerationConfig
-
-#         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-#         self.model = AutoModelForCausalLM.from_pretrained(
-#             model_name,
-#             device_map=device_map,
-#             torch_dtype=torch_dtype,
-#             trust_remote_code=trust_remote_code,
-#             attn_implementation=attn_implementation,
-#         )
-#         self.gcfg = self._GenerationConfig(
-#             max_new_tokens=max_new_tokens,
-#             do_sample=True if temperature and temperature > 0 else False,
-#             temperature=temperature,
-#             top_p=top_p,
-#             repetition_penalty=repetition_penalty,
-#             eos_token_id=self.tokenizer.eos_token_id,
-#             pad_token_id=self.tokenizer.eos_token_id,
-#         )
-
-#     async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
-#         prompt = to_chat_text(self.tokenizer, messages)
-#         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-
-#         def _generate_blocking():
-#             with self._torch.no_grad():
-#                 out = self.model.generate(**inputs, generation_config=self.gcfg)
-#             return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-#         return await run_blocking(_generate_blocking)
-
-#     async def astream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncIterator[str]:
-#         from threading import Thread
-
-#         prompt = to_chat_text(self.tokenizer, messages)
-#         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-#         streamer = self._TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
-
-#         def _worker():
-#             with self._torch.no_grad():
-#                 self.model.generate(**inputs, generation_config=self.gcfg, streamer=streamer)
-
-#         thread = Thread(target=_worker, daemon=True)
-#         thread.start()
-
-#         for token_text in streamer:
-#             yield token_text
-
 # ========= Minimal Runtime ====================================================
 class SimpleRuntime:
     """
     1) Call LLM
     2) Apply output rails (sync + async)
     """
-    def __init__(self, config: RailsConfig, llm: BaseLLM, output_rules: List[BaseOutputRule] = None):
+    def __init__(self, config: RailsConfig, llm: BaseLLM,  rules=None, output_rules: List[BaseOutputRule] = None):
         self.config = config
         self.llm = llm
         self.output_rules = output_rules or []
+        self.rules = rules or []
 
-    async def run_once(self, messages, context) -> str:
-        buffer_text = ""
-        last_safe = ""
-
+    async def run_once(self, messages, context):
+        output = ""
         async for token in self.llm.astream(messages):
-            buffer_text += token
-            ok, rail_text, rails_reason = await self._apply_output_rails_async(buffer_text, context)
-            if not ok:
-                return f"Sorry, I can’t share that. (blocked: {rails_reason})"
-            last_safe = rail_text  # keep the latest safe version
+            output += token
 
-        # after streaming completes, return the final safe text
-        return last_safe
-
-
-
-
+            # Apply rules incrementally
+            rule_results = await self._apply_output_rails_async(output, context)
+            for rr in rule_results:
+                if rr.action == "block":
+                    # Make sure to stop streaming cleanly
+                    # await self.llm.aclose()   # or equivalent cancel/close
+                    return f"Sorry, I can’t share that. (blocked: {rr.reason})"
+                elif rr.action == "replace":
+                    # await self.llm.aclose()
+                    return rr.text
+        # return OutputRuleResult("block", reason="blocked_by_regex_rail_Block Sensitive AMD Info")
+        return output
+    
     async def run_stream(self, messages: List[Dict[str, str]], context: Dict[str, Any]) -> AsyncIterator[str]:
         buffer_text = ""
         last_sent = ""
@@ -192,10 +116,30 @@ class SimpleRuntime:
         async for chunk in self.llm.astream(messages):
             full_text += chunk
             # Check the full text buffer on each new chunk
-            ok, rail_text, rails_reason = await self._apply_output_rails_async(full_text, context)
-            if not ok:
+            rule_results = await self._apply_output_rails_async(full_text, context)
+
+            # Default: allow
+            blocked = False
+            rails_reason = ""
+            rail_text = full_text
+
+            for rr in rule_results:
+                if rr.action == "block":
+                    blocked = True
+                    rails_reason = rr.reason
+                    break
+                elif rr.action == "replace":
+                    rail_text = rr.text
+
+            if blocked:
+                if hasattr(self.llm, "aclose"):
+                    await self.llm.aclose()
                 yield f"Sorry, I can’t share that. (blocked: {rails_reason})"
+                # Drain the generator to stop the background thread
+                async for _ in self.llm.astream(messages):
+                    break
                 return
+
 
             # Yield the delta between the last safe text and the current safe text
             delta = rail_text[len(last_sent):]
@@ -203,48 +147,34 @@ class SimpleRuntime:
                 yield delta
             last_sent = rail_text
 
-    async def _apply_output_rails_async(self, text: str, context: dict) -> Tuple[bool, str, str]:
-        rail_text = text if text is not None else ""
-        # per-instance moderation progress (rule_name -> last_checked_len)
-        if not hasattr(self, "_mod_progress"):
-            self._mod_progress = {}
+    async def _apply_output_rails_async(self, text: str, context: dict):
+        results = []
+        for rule in self.rules:
+            # If the rule has async classification (like LLMCheckRule)
+            if hasattr(rule, "classify"):
+                verdict = await rule.classify(text)
 
-        # how often to run async moderation (in chars)
-        stride = 200
-        # allow override via context, but don’t require it
-        if context and isinstance(context, dict):
-            stride = int(context.get("moderation_min_chunk", stride))
+                if verdict == "UNSAFE":
+                    results.append(OutputRuleResult(
+                        action="block",
+                        reason=f"blocked_by_async_rail_{rule.name}",
+                        text=text,
+                    ))
+                elif verdict == "UNSURE":
+                    results.append(OutputRuleResult(
+                        action="block" if not rule.allow_on_unsure else "allow",
+                        reason=f"unsure_by_async_rail_{rule.name}",
+                        text=text,
+                    ))
+                else:  # SAFE
+                    results.append(OutputRuleResult(action="allow", text=text))
 
-        for rule in self.output_rules:
-            # Synchronous phase
-            try:
-                sync_result = rule.apply(rail_text, context or {})
-                if sync_result.action == "block":
-                    return False, "", sync_result.reason or f"blocked_by_{getattr(rule, 'name', 'unnamed_rule')}"
-                elif sync_result.action == "replace":
-                    rail_text = sync_result.text
-            except Exception as e:
-                return False, "", f"rule_exception_sync:{type(e).__name__}"
+            else:
+                # Synchronous rules like RegexRule
+                results.append(rule.apply(text, context))
 
-            # Async phase (e.g., LLM moderation)
-            if hasattr(rule, "classify") and callable(rule.classify):
-                rule_name = getattr(rule, "name", "unnamed_rule")
-                last_len = self._mod_progress.get(rule_name, 0)
-                # only classify if we’ve grown by at least `stride`
-                if len(rail_text) - last_len < stride:
-                    continue
-                self._mod_progress[rule_name] = len(rail_text)
-
-                try:
-                    verdict = await rule.classify(rail_text)
-                    if verdict == "UNSAFE":
-                        return False, "", f"blocked_by_async_rail_{rule_name}"
-                    if verdict == "UNSURE" and not getattr(rule, "allow_on_unsure", True):
-                        return False, "", f"blocked_by_async_unsure_{rule_name}"
-                except Exception as e:
-                    return False, "", f"rule_exception_async:{type(e).__name__}"
-
-        return True, rail_text, ""
+        return results
+    
 # ========= Public Rails API ===================================================
 class LLMRails:
     def __init__(self, config: RailsConfig, llm: Optional[BaseLLM] = None):
@@ -254,9 +184,15 @@ class LLMRails:
         self.output_rules = self._load_rules_from_config("config/rails.yml")
         self.runtime = SimpleRuntime(
             config=self.config,
-            llm=self.llm,
-            output_rules=self.output_rules
+            llm=HFChatLLM(
+                model_name="amd/Instella-3B-Instruct",
+                device_map="cpu",
+                torch_dtype=None,
+                temperature=0.0,
+            ),
+            rules=self.output_rules,  # ✅ use YAML rules
         )
+
 
     def _load_rules_from_config(self, filepath: str) -> List[BaseOutputRule]:
         # Map the 'type' string from YAML to the actual Python class
