@@ -1,22 +1,7 @@
-#this is for cuda
-# --extra-index-url https://download.pytorch.org/whl/cu121
-# torch
-# torchvision
-# torchaudio
-# transformers
-# accelerate
-# sentence-transformers
-# faiss-cpu
-# PyYAML
-# this is for amd cluster
-# requirements.txt
-
---extra-index-url https://download.pytorch.org/whl/rocm6.0
-torch
-torchvision
-torchaudio
 transformers
 accelerate
 sentence-transformers
 faiss-cpu
 PyYAML
+fastapi==0.111.0
+uvicorn[standard]==0.30.1

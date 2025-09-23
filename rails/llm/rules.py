@@ -1,18 +1,23 @@
 import re
 import httpx
 from typing import List, Dict, Any
+import torch
+import asyncio
 
-# Define a standard result object for all rules to return
-class OutputRuleResult:
-    def __init__(self, action: str, reason: str = "", text: str = ""):
-        self.action = action  # "allow" | "block" | "replace"
-        self.reason = reason
-        self.text = text
+# from rails.llm.minimal_llmrails import HFChatLLM
+from .hf_llm import HFChatLLM 
+from .rule_base import BaseOutputRule, OutputRuleResult
 
-# Base class that all rule classes will inherit from
-class BaseOutputRule:
-    def apply(self, text: str, context: Dict[str, Any]) -> OutputRuleResult:
-        raise NotImplementedError
+# class OutputRuleResult:
+#     def __init__(self, action: str, reason: str = "", text: str = ""):
+#         self.action = action  # "allow" | "block" | "replace"
+#         self.reason = reason
+#         self.text = text
+
+# # Base class that all rule classes will inherit from
+# class BaseOutputRule:
+#     def apply(self, text: str, context: Dict[str, Any]) -> OutputRuleResult:
+#         raise NotImplementedError
 
 # A generic RegexRule that gets its patterns from the config
 class RegexRule(BaseOutputRule):
@@ -34,29 +39,86 @@ class RegexRule(BaseOutputRule):
         return OutputRuleResult("allow")
 
 # The HTTP rule, refactored to take a config dictionary
-class SemanticSafetyHTTPRule(BaseOutputRule):
-    def __init__(self, name: str, endpoint: str, on_fail: str = "allow", timeout_s: float = 5.0, api_key: str = None, **kwargs):
+# class SemanticSafetyHTTPRule(BaseOutputRule):
+#     def __init__(self, name: str, endpoint: str, on_fail: str = "allow", timeout_s: float = 5.0, api_key: str = None, **kwargs):
+#         self.name = name
+#         self.endpoint = endpoint.rstrip("/")
+#         self.api_key = api_key
+#         self.timeout_s = timeout_s
+#         self.allow_on_unsure = on_fail == "allow"
+
+    # async def classify(self, text: str) -> str:
+    #     payload = {"text": text}
+    #     headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+    #     try:
+    #         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+    #             r = await client.post(f"{self.endpoint}/moderate", json=payload, headers=headers)
+    #         r.raise_for_status()
+    #         data = r.json() if r.content else {}
+    #         verdict = str(data.get("verdict", "SAFE")).strip().upper()
+    #         if verdict not in ("SAFE", "UNSAFE", "UNSURE"):
+    #             verdict = "UNSURE" # Default to unsure if the server gives a weird response
+    #         return verdict
+    #     except Exception:
+    #         return "UNSURE"
+
+    # def apply(self, text: str, context: Dict[str, Any]) -> OutputRuleResult:
+    #     # The synchronous part does not block. The async rails will await classify().
+    #     return OutputRuleResult("allow")
+class LLMCheckRule(BaseOutputRule):
+    def __init__(self, name: str, model: str, on_fail: str = "block", **kwargs):
         self.name = name
-        self.endpoint = endpoint.rstrip("/")
-        self.api_key = api_key
-        self.timeout_s = timeout_s
+        # Default behavior: block on UNSURE unless explicitly overridden
         self.allow_on_unsure = on_fail == "allow"
 
+        print(f"Loading moderation model on CPU: {model}")
+        self.classifier_llm = HFChatLLM(
+            model_name=model,
+            device_map="cpu",
+            torch_dtype=None,
+            max_new_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            repetition_penalty=1.0,
+        )
+
     async def classify(self, text: str) -> str:
-        payload = {"text": text}
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict AMD IP safety classifier. "
+                    "If the text contains ANY technical details about AMD architectures "
+                    "(Zen, branch predictors, caches, micro-architecture, predictors, etc.), "
+                    "respond UNSAFE. Otherwise respond SAFE. If unsure, respond UNSURE."
+                ),
+            },
+            {"role": "user", "content": text},
+        ]
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-                r = await client.post(f"{self.endpoint}/moderate", json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json() if r.content else {}
-            verdict = str(data.get("verdict", "SAFE")).strip().upper()
-            if verdict not in ("SAFE", "UNSAFE", "UNSURE"):
-                verdict = "UNSURE" # Default to unsure if the server gives a weird response
-            return verdict
-        except Exception:
+            resp = await asyncio.wait_for(self.classifier_llm.acomplete(prompt), timeout=2.0)
+        except asyncio.TimeoutError:
             return "UNSURE"
 
-    def apply(self, text: str, context: Dict[str, Any]) -> OutputRuleResult:
-        # The synchronous part does not block. The async rails will await classify().
-        return OutputRuleResult("allow")
+        verdict = resp.strip().split()[0].upper()
+        if verdict not in {"SAFE", "UNSAFE", "UNSURE"}:
+            return "UNSURE"
+
+        # Block unless explicitly SAFE
+        if verdict == "UNSURE" and not self.allow_on_unsure:
+            return "UNSAFE"
+        return verdict
+    def apply(self, text: str, context: dict) -> OutputRuleResult:
+        # Sync phase: don’t block, just pass text forward
+        return OutputRuleResult(action="allow", reason="", text=text)
+
+class BlockSensitiveAMDInfo(RegexRule):
+    def __init__(self):
+        super().__init__(
+            name="Block Sensitive AMD Info",
+            patterns=[
+                r"(AMD|Ryzen|Zen\s*\d+)",  # product pattern
+                r"(branch\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\s*table)"  # sensitive pattern
+            ]
+        )

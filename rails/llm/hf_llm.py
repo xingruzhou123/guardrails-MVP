@@ -3,6 +3,7 @@
 from __future__ import annotations
 from threading import Thread
 from typing import Any, AsyncIterator, Dict, List, Optional
+from .utils import to_chat_text, run_blocking
 
 import torch
 from transformers import (
@@ -12,7 +13,6 @@ from transformers import (
     GenerationConfig,
 )
 
-from utils import to_chat_text, run_blocking
 
 class HFChatLLM:
     """
@@ -90,6 +90,8 @@ class HFChatLLM:
         thread = Thread(target=_worker, daemon=True)
         thread.start()
 
-        # Stream async-by-iterating the streamer (which is a blocking iterator)
-        for token_text in streamer:
-            yield token_text
+        try:
+            for token_text in streamer:
+                yield token_text
+        finally:
+            thread.join(timeout=5)  # wait for worker to finish or timeout

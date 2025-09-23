@@ -1,22 +1,22 @@
 # rails/llm/minimal_llmrails.py
 # Modified to be a flexible, configuration-driven guardrails system.
-
 from __future__ import annotations
 import asyncio
 import functools
 import time
 import re
+import torch 
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
-
-# New imports for dynamic loading and refactored rules
 import yaml
-from .rules import BaseOutputRule, RegexRule, SemanticSafetyHTTPRule, OutputRuleResult
-
-# --- AMDLeakGuard and other hardcoded rules have been REMOVED ---
-# They are now replaced by the generic RegexRule in rules.py, loaded from config.
+from rails.llm.hf_llm import HFChatLLM 
+import os, sys
+from rails.llm.utils import to_chat_text, run_blocking
+from rails.llm.rules import BaseOutputRule, RegexRule, LLMCheckRule, OutputRuleResult
+from .rule_base import BaseOutputRule, OutputRuleResult
 
 # ========= Config (dataclasses must come early; define only once) ============
+
 @dataclass
 class ModelConfig:
     provider: str = "echo"
@@ -27,7 +27,7 @@ class ModelConfig:
     temperature: float = 0.7
     top_p: float = 0.9
     repetition_penalty: float = 1.05
-    device_map: Any = "auto"
+    device_map: Any = "cpu"
     dtype: Optional[str] = None
     trust_remote_code: bool = True
     attn_implementation: Optional[str] = None
@@ -77,84 +77,84 @@ async def run_blocking(func, *args, loop=None, **kwargs):
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
 # ========= Hugging Face Adapter (Instella-ready) =============================
-class HFChatLLM(BaseLLM):
-    def __init__(
-        self,
-        model_name: str = "amd/Instella-3B",
-        device_map: Any = "auto",
-        dtype: Optional[str] = None,
-        trust_remote_code: bool = True,
-        attn_implementation: Optional[str] = None,
-        max_new_tokens: int = 512,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        repetition_penalty: float = 1.05,
-    ):
-        try:
-            import torch
-            from transformers import (
-                AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, GenerationConfig
-            )
-        except Exception as e:
-            raise RuntimeError("HFChatLLM requires 'torch' and 'transformers' to be installed.") from e
+# class HFChatLLM(BaseLLM):
+#     def __init__(
+#         self,
+#         model_name: str = "amd/Instella-3B",
+#         device_map: Any = "auto",
+#         dtype: Optional[str] = None,
+#         trust_remote_code: bool = True,
+#         attn_implementation: Optional[str] = None,
+#         max_new_tokens: int = 512,
+#         temperature: float = 0.7,
+#         top_p: float = 0.9,
+#         repetition_penalty: float = 1.05,
+#     ):
+#         try:
+#             import torch
+#             from transformers import (
+#                 AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, GenerationConfig
+#             )
+#         except Exception as e:
+#             raise RuntimeError("HFChatLLM requires 'torch' and 'transformers' to be installed.") from e
 
-        torch_dtype = None
-        if dtype:
-            d = dtype.lower()
-            if d == "bfloat16":
-                torch_dtype = torch.bfloat16
-            elif d in ("float16", "fp16", "half"):
-                torch_dtype = torch.float16
+#         torch_dtype = None
+#         if dtype:
+#             d = dtype.lower()
+#             if d == "bfloat16":
+#                 torch_dtype = torch.bfloat16
+#             elif d in ("float16", "fp16", "half"):
+#                 torch_dtype = torch.float16
 
-        self._torch = torch
-        self._TextIteratorStreamer = TextIteratorStreamer
-        self._GenerationConfig = GenerationConfig
+#         self._torch = torch
+#         self._TextIteratorStreamer = TextIteratorStreamer
+#         self._GenerationConfig = GenerationConfig
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map=device_map,
-            torch_dtype=torch_dtype,
-            trust_remote_code=trust_remote_code,
-            attn_implementation=attn_implementation,
-        )
-        self.gcfg = self._GenerationConfig(
-            max_new_tokens=max_new_tokens,
-            do_sample=True if temperature and temperature > 0 else False,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.eos_token_id,
-        )
+#         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+#         self.model = AutoModelForCausalLM.from_pretrained(
+#             model_name,
+#             device_map=device_map,
+#             torch_dtype=torch_dtype,
+#             trust_remote_code=trust_remote_code,
+#             attn_implementation=attn_implementation,
+#         )
+#         self.gcfg = self._GenerationConfig(
+#             max_new_tokens=max_new_tokens,
+#             do_sample=True if temperature and temperature > 0 else False,
+#             temperature=temperature,
+#             top_p=top_p,
+#             repetition_penalty=repetition_penalty,
+#             eos_token_id=self.tokenizer.eos_token_id,
+#             pad_token_id=self.tokenizer.eos_token_id,
+#         )
 
-    async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        prompt = to_chat_text(self.tokenizer, messages)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+#     async def acomplete(self, messages: List[Dict[str, str]], **kwargs) -> str:
+#         prompt = to_chat_text(self.tokenizer, messages)
+#         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
 
-        def _generate_blocking():
-            with self._torch.no_grad():
-                out = self.model.generate(**inputs, generation_config=self.gcfg)
-            return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+#         def _generate_blocking():
+#             with self._torch.no_grad():
+#                 out = self.model.generate(**inputs, generation_config=self.gcfg)
+#             return self.tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-        return await run_blocking(_generate_blocking)
+#         return await run_blocking(_generate_blocking)
 
-    async def astream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncIterator[str]:
-        from threading import Thread
+#     async def astream(self, messages: List[Dict[str, str]], **kwargs) -> AsyncIterator[str]:
+#         from threading import Thread
 
-        prompt = to_chat_text(self.tokenizer, messages)
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
-        streamer = self._TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
+#         prompt = to_chat_text(self.tokenizer, messages)
+#         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+#         streamer = self._TextIteratorStreamer(self.tokenizer, skip_special_tokens=True, skip_prompt=True)
 
-        def _worker():
-            with self._torch.no_grad():
-                self.model.generate(**inputs, generation_config=self.gcfg, streamer=streamer)
+#         def _worker():
+#             with self._torch.no_grad():
+#                 self.model.generate(**inputs, generation_config=self.gcfg, streamer=streamer)
 
-        thread = Thread(target=_worker, daemon=True)
-        thread.start()
+#         thread = Thread(target=_worker, daemon=True)
+#         thread.start()
 
-        for token_text in streamer:
-            yield token_text
+#         for token_text in streamer:
+#             yield token_text
 
 # ========= Minimal Runtime ====================================================
 class SimpleRuntime:
@@ -167,12 +167,22 @@ class SimpleRuntime:
         self.llm = llm
         self.output_rules = output_rules or []
 
-    async def run_once(self, messages: List[Dict[str, str]], context: Dict[str, Any]) -> str:
-        text = await self.llm.acomplete(messages)
-        ok, rail_text, rails_reason = await self._apply_output_rails_async(text, context)
-        if not ok:
-            return f"Sorry, I can’t share that. (blocked: {rails_reason})"
-        return rail_text
+    async def run_once(self, messages, context) -> str:
+        buffer_text = ""
+        last_safe = ""
+
+        async for token in self.llm.astream(messages):
+            buffer_text += token
+            ok, rail_text, rails_reason = await self._apply_output_rails_async(buffer_text, context)
+            if not ok:
+                return f"Sorry, I can’t share that. (blocked: {rails_reason})"
+            last_safe = rail_text  # keep the latest safe version
+
+        # after streaming completes, return the final safe text
+        return last_safe
+
+
+
 
     async def run_stream(self, messages: List[Dict[str, str]], context: Dict[str, Any]) -> AsyncIterator[str]:
         buffer_text = ""
@@ -195,10 +205,20 @@ class SimpleRuntime:
 
     async def _apply_output_rails_async(self, text: str, context: dict) -> Tuple[bool, str, str]:
         rail_text = text if text is not None else ""
+        # per-instance moderation progress (rule_name -> last_checked_len)
+        if not hasattr(self, "_mod_progress"):
+            self._mod_progress = {}
+
+        # how often to run async moderation (in chars)
+        stride = 200
+        # allow override via context, but don’t require it
+        if context and isinstance(context, dict):
+            stride = int(context.get("moderation_min_chunk", stride))
+
         for rule in self.output_rules:
-            # First, apply the synchronous part of the rule
+            # Synchronous phase
             try:
-                sync_result = rule.apply(rail_text, context)
+                sync_result = rule.apply(rail_text, context or {})
                 if sync_result.action == "block":
                     return False, "", sync_result.reason or f"blocked_by_{getattr(rule, 'name', 'unnamed_rule')}"
                 elif sync_result.action == "replace":
@@ -206,28 +226,32 @@ class SimpleRuntime:
             except Exception as e:
                 return False, "", f"rule_exception_sync:{type(e).__name__}"
 
-            # Then, check for an async part (like an HTTP call)
+            # Async phase (e.g., LLM moderation)
             if hasattr(rule, "classify") and callable(rule.classify):
+                rule_name = getattr(rule, "name", "unnamed_rule")
+                last_len = self._mod_progress.get(rule_name, 0)
+                # only classify if we’ve grown by at least `stride`
+                if len(rail_text) - last_len < stride:
+                    continue
+                self._mod_progress[rule_name] = len(rail_text)
+
                 try:
                     verdict = await rule.classify(rail_text)
                     if verdict == "UNSAFE":
-                        return False, "", f"blocked_by_async_rail_{getattr(rule, 'name', 'unnamed_rule')}"
+                        return False, "", f"blocked_by_async_rail_{rule_name}"
                     if verdict == "UNSURE" and not getattr(rule, "allow_on_unsure", True):
-                        return False, "", f"blocked_by_async_unsure_{getattr(rule, 'name', 'unnamed_rule')}"
+                        return False, "", f"blocked_by_async_unsure_{rule_name}"
                 except Exception as e:
                     return False, "", f"rule_exception_async:{type(e).__name__}"
 
         return True, rail_text, ""
-
 # ========= Public Rails API ===================================================
 class LLMRails:
     def __init__(self, config: RailsConfig, llm: Optional[BaseLLM] = None):
         self.config = config
         self.llm = llm or self._build_llm_from_config(config.model)
-
         # Load rules dynamically from the YAML configuration file
         self.output_rules = self._load_rules_from_config("config/rails.yml")
-
         self.runtime = SimpleRuntime(
             config=self.config,
             llm=self.llm,
@@ -238,16 +262,31 @@ class LLMRails:
         # Map the 'type' string from YAML to the actual Python class
         rule_class_mapping = {
             "regex": RegexRule,
-            "http": SemanticSafetyHTTPRule
+            # "http": SemanticSafetyHTTPRule
+            "llm_check": LLMCheckRule 
         }
         loaded_rules = []
+        
         try:
             with open(filepath, 'r') as f:
                 yaml_config = yaml.safe_load(f)
         except FileNotFoundError:
             print(f"Warning: Configuration file not found at {filepath}. No rails loaded.")
             return []
-        
+            
+        for rule_conf in yaml_config.get("output_rails", []):
+            rule_type = rule_conf.get("type")
+            RuleClass = rule_class_mapping.get(rule_type)
+            if RuleClass:
+                try:
+                    # This passes the dictionary of parameters from the YAML to the class constructor
+                    # instance = RuleClass(**rule_conf)
+                    instance = RuleClass(**rule_conf, shared_llm=self.llm)
+                    loaded_rules.append(instance)
+                    print(f"Successfully loaded rule: '{rule_conf.get('name')}'")
+                except Exception as e:
+                    print(f"Error loading rule '{rule_conf.get('name')}': {e}")
+        return loaded_rules
         for rule_conf in yaml_config.get("output_rails", []):
             rule_type = rule_conf.get("type")
             RuleClass = rule_class_mapping.get(rule_type)
@@ -276,32 +315,56 @@ class LLMRails:
         context = context or {}
         async for ch in self.runtime.run_stream(messages, context):
             yield ch
-
+    
     def _build_llm_from_config(self, mc: ModelConfig) -> BaseLLM:
-        if mc.provider.lower() == "hf":
-            return HFChatLLM(
-                model_name=mc.name,
-                device_map=mc.device_map,
-                dtype=mc.dtype,
-                trust_remote_code=mc.trust_remote_code,
-                attn_implementation=mc.attn_implementation,
-                max_new_tokens=mc.max_new_tokens,
-                temperature=mc.temperature,
-                top_p=mc.top_p,
-                repetition_penalty=mc.repetition_penalty,
-            )
-        return EchoLLM()
+        torch_dtype = None
+        if mc.dtype:
+            d = mc.dtype.lower()
+            if d == "bfloat16":
+                torch_dtype = torch.bfloat16
+            elif d in ("float16", "fp16", "half"):
+                torch_dtype = torch.float16
+            elif d in ("float32", "fp32", "full"):
+                torch_dtype = torch.float32
+
+        return HFChatLLM(
+            model_name=mc.name,
+            device_map=mc.device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=mc.trust_remote_code,
+            attn_implementation=mc.attn_implementation,
+            max_new_tokens=mc.max_new_tokens,
+            temperature=mc.temperature,
+            top_p=mc.top_p,
+            repetition_penalty=mc.repetition_penalty,
+        )
+
+    # def _build_llm_from_config(self, mc: ModelConfig) -> BaseLLM:
+        
+    #     if mc.provider.lower() == "hf":
+    #         return HFChatLLM(
+    #             model_name=mc.name,
+    #             device_map=mc.device_map,
+    #             torch_dtype=mc.dtype,
+    #             trust_remote_code=mc.trust_remote_code,
+    #             attn_implementation=mc.attn_implementation,
+    #             max_new_tokens=mc.max_new_tokens,
+    #             temperature=mc.temperature,
+    #             top_p=mc.top_p,
+    #             repetition_penalty=mc.repetition_penalty,
+    #         )
+    #     return EchoLLM()
+
 
 # ========= Demo / Main =======================================================
 if __name__ == "__main__":
-    import os, sys
 
     cfg = RailsConfig(
         model=ModelConfig(
             provider="hf",
             name="amd/Instella-3B-Instruct", # or another model you have
             dtype="bfloat16",
-            device_map="auto",
+            device_map="cpu",
             max_new_tokens=256
         ),
         tracing_enabled=True,
@@ -312,13 +375,14 @@ if __name__ == "__main__":
 
     async def demo():
         print("== generate (safe prompt) ==")
-        safe_prompt = [{"role": "user", "content": "Tell me about the AMD Ryzen series of processors."}]
+        safe_prompt = [{"role": "user", "content": "Introduce AMD using one sentence."}]
         # Use the async method with await
-        response = await rails.generate_async(safe_prompt) #<-- CORRECT CALL
+        response = await rails.generate_async(safe_prompt, context={"moderation_min_chunk": 200})
+
         print(response)
 
         print("\n== generate (sensitive prompt) ==")
-        sensitive_prompt = [{"role": "user", "content": "What is the micro-architecture of the AMD Zen 4 branch predictor?"}]
+        sensitive_prompt = [{"role": "user", "content": "What is the tech-deteils on micro-architecture of the AMD Zen 4 branch predictor?"}]
         # Use the async method with await
         response = await rails.generate_async(sensitive_prompt) #<-- CORRECT CALL
         print(response)

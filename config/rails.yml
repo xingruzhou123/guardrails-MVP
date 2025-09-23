@@ -9,11 +9,13 @@ output_rails:
     # The second list identifies the sensitive terms.
     # The rule will trigger if a match is found from BOTH lists.
     patterns:
-      - "(?i)\\b(amd|zen\\d?|ryzen|epyc|rdna|cdna)\\b"
-      - "(?i)(micro-?architecture|branch-?predictor|l[123]-?cache|rtl|verilog|die-?shot|floorplan)"
+      - "(Ryzen|EPYC|Instinct)"              # product keywords
+      - "(branch predictor|cache design|pipeline|decoder)"  # sensitive terms
 
-  - name: "External Moderation Service"
-    type: "http"
-    description: "Calls the external Flask app for a safety verdict."
-    endpoint: "http://127.0.0.1:5000/moderate" # Assuming your app.py runs on port 5000
-    on_fail: "allow" # What to do on a network error: "allow" or "block"
+  - name: "Instella Moderation"
+    type: "llm_check"
+    description: "Uses Instella-3B for an in-process safety verdict."
+    model: "amd/Instella-3B-Instruct" # Specify the model to use for this rule
+    #maybe in future will change to a specific trained model to do safety things
+    on_fail: "allow"
+    device_map: "cpu"
