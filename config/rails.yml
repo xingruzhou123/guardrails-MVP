@@ -22,11 +22,13 @@
 output_rails:
   - name: "Block Sensitive AMD Info"
     type: "regex"
-    patterns:
-      - "(AMD|Ryzen|Zen\\s*\\d+)"
-      - "(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+    model: "Qwen/Qwen3-4B-Thinking-2507"
+    pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
 
-  - name: "Instella Moderation"
+  - name: "Llama Semantic Guard"
     type: "llm_check"
-    model: "amd/Instella-3B-Instruct"
-    on_fail: "allow"   # ✅ important: do not block on UNSURE
+    model: "meta-llama/Llama-Guard-3-1b"
+    on_fail: "allow" #if want the unsure also view as unsafe then change this to faule
+    #currently we set the unsure as safety
+
+

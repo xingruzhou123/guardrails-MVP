@@ -1,0 +1,20 @@
+{
+    "name": "AMD Guardrails Dev",
+    "image": "rocm/vllm:latest",
+    "runArgs": [
+        "--network=host",
+        "--group-add=video",
+        "--ipc=host",
+        "--cap-add=SYS_PTRACE",
+        "--security-opt=seccomp=unconfined",
+        "--privileged",
+        "--device=/dev/kfd",
+        "--device=/dev/dri"
+    ],
+    "mounts": [
+        "source=/home/xingrzho/amd_guardrails/guardrails-MVP,target=/app/guardrails,type=bind",
+        "source=/home/user/models/llama-2-7b-chat-hf,target=/app/model,type=bind"
+    ],
+    "remoteUser": "root",
+    "workspaceFolder": "/app/guardrails"
+}

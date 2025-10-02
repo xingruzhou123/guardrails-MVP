@@ -24,7 +24,7 @@ class HFChatLLM:
 
     def __init__(
         self,
-        model_name: str = "amd/Instella-3B",
+        model_name: str = "Qwen/Qwen3-4B-Thinking-2507",
         device_map: str | dict = "auto",
         torch_dtype: Optional[torch.dtype] = None,  # e.g., torch.bfloat16
         trust_remote_code: bool = True,
