@@ -4,4 +4,5 @@ sentence-transformers
 faiss-cpu
 PyYAML
 fastapi==0.111.0
+uvicorn[standard]==0.30.1fastapi==0.111.0
 uvicorn[standard]==0.30.1

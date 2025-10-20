@@ -19,16 +19,40 @@
 #     #maybe in future will change to a specific trained model to do safety things
 #     on_fail: "allow"
 #     device_map: "cpu"
+# output_rails:
+#   - name: "Block Sensitive AMD Info"
+#     type: "regex"
+#     model: "Qwen/Qwen3-4B-Thinking-2507"
+#     pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+
+#   - name: "Llama Semantic Guard"
+#     type: "llm_check"
+#     model: "meta-llama/Llama-Guard-3-1b"
+#     on_fail: "allow" #if want the unsure also view as unsafe then change this to faule
+#     #currently we set the unsure as safety
+
+input_rails:
+  - name: detect_user_intent
+    description: Detect user intent and classify risky inputs
+    module: guardrails.builtins.intent_detection
+    config:
+      intents:
+        - ask for technical details of an AMD product
+        - query the price of a specific product
+        - control a robot arm to move
+        - get the latest company news
+
 output_rails:
-  - name: "Block Sensitive AMD Info"
-    type: "regex"
-    model: "Qwen/Qwen3-4B-Thinking-2507"
-    pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+  - name: block_sensitive_amd_info
+    description: Block micro-architecture or sensitive AMD topics
+    module: guardrails.builtins.regex
+    config:
+      pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+      on_fail: filter  # blocks matched text safely
 
-  - name: "Llama Semantic Guard"
-    type: "llm_check"
-    model: "meta-llama/Llama-Guard-3-1b"
-    on_fail: "allow" #if want the unsure also view as unsafe then change this to faule
-    #currently we set the unsure as safety
-
-
+  - name: llama_semantic_guard
+    description: Analyze output for safety using Llama Guard
+    module: guardrails.builtins.llm_check
+    config:
+      model: "meta-llama/Llama-Guard-3-1b"
+      on_fail: allow  # or 'allow' if you want soft fail
