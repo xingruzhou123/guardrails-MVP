@@ -9,22 +9,36 @@ class IntentDetectionRule(BaseOutputRule):
     使用向量数据库 (Chroma) 检测用户意图的规则。
     """
 
+    # --- 1. 添加这个集合 ---
+    # 定义哪些意图应该被 "放行" 给LLM（因为输出规则会处理它们）
+    PASS_THROUGH_INTENTS = {"ask for technical details of an AMD product"}
+
     def __init__(self, name: str, intents: List[str], threshold: float = 0.5, **kwargs):
         self.name = name
         self.intents = intents
-        self.threshold = threshold
+        self.threshold = threshold  # 0.5 对 'cosine' 来说是合理的阈值
 
         self.client = chromadb.Client()
-        self.encoder = SentenceTransformer(
-            "all-MiniLM-L6-v2"
-        )  # 一个轻量且高效的嵌入模型
-        self.collection = self.client.get_or_create_collection(
-            name="user_intents_collection"
-        )
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
 
-        # 2. 如果集合是空的，则将您在YAML中定义的意图转换为向量并存入数据库
+        # --- 2. 强制删除并重建 Collection (修复“结果颠倒”的问题) ---
+        collection_name = "user_intents_cosine_v3"  # 使用一个新名字
+        try:
+            self.client.delete_collection(name=collection_name)
+            print(f"[debug] Deleted existing Chroma collection: {collection_name}")
+        except Exception:
+            pass  # collection 不存在，没问题
+
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},  # <-- 关键：使用余弦相似度
+        )
+        # --- 修复结束 ---
+
         if self.collection.count() == 0:
-            print("[debug] Creating new ChromaDB collection for intents.")
+            print(
+                f"[debug] Re-creating ChromaDB collection for intents (using cosine)."
+            )
             intent_embeddings = self.encoder.encode(self.intents)
             self.collection.add(
                 embeddings=intent_embeddings,
@@ -40,16 +54,30 @@ class IntentDetectionRule(BaseOutputRule):
 
         results = self.collection.query(query_embeddings=query_embedding, n_results=1)
 
-        distance = results["distances"][0][0]
-        # ChromaDB 返回的是L2距离，值越小表示越相似。
-        # 我们可以简单地用一个阈值来判断。
+        # 检查是否有有效结果
+        if not results or not results.get("distances") or not results["distances"][0]:
+            return OutputRuleResult(action="allow", reason="No intent detected")
 
+        distance = results["distances"][0][0]
+
+        # Chroma 'cosine' 距离是 1 - similarity。
+        # 所以 distance < 0.5 意味着 similarity > 0.5
         if distance < self.threshold:
             detected_intent = results["documents"][0][0]
-            # 返回一个新的 "dispatch" 动作，通知运行时(runtime)去调用动作模块
+
+            # --- 3. 添加这个新的判断逻辑 ---
+            if detected_intent in self.PASS_THROUGH_INTENTS:
+                # 这是一个高风险意图，我们 "允许" 它，
+                # 让输出规则来处理LLM的回答。
+                return OutputRuleResult(
+                    action="allow",
+                    reason=f"High-risk intent '{detected_intent}' detected, passing to LLM.",
+                )
+
+            # 这是一个需要 "调度" 的意图 (例如控制机器人)
             return OutputRuleResult(
                 action="dispatch", reason=detected_intent, text=text
             )
 
-        # 如果没有匹配到任何意图，则允许流程继续
+        # 如果距离 > 阈值，则不匹配
         return OutputRuleResult(action="allow", reason="No intent detected")
