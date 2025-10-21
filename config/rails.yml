@@ -1,58 +1,36 @@
-# # this file is for users to define their own custom settings# This file defines the safety rails for the application.
-# # It's a "Colang alternative" that separates configuration from code.
-
-# output_rails:
-#   - name: "Block Sensitive AMD Info"
-#     type: "regex"
-#     description: "Blocks output containing both an AMD product and a sensitive micro-architectural term."
-#     # The first list of patterns identifies the brand/product.
-#     # The second list identifies the sensitive terms.
-#     # The rule will trigger if a match is found from BOTH lists.
-#     patterns:
-#       - "(AMD|Ryzen|Zen\\s*\\d+)"
-#       - "(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
-
-#   - name: "Instella Moderation"
-#     type: "llm_check"
-#     description: "Uses Instella-3B for an in-process safety verdict."
-#     model: "amd/Instella-3B-Instruct" # Specify the model to use for this rule
-#     #maybe in future will change to a specific trained model to do safety things
-#     on_fail: "allow"
-#     device_map: "cpu"
-# output_rails:
-#   - name: "Block Sensitive AMD Info"
-#     type: "regex"
-#     model: "Qwen/Qwen3-4B-Thinking-2507"
-#     pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
-
-#   - name: "Llama Semantic Guard"
-#     type: "llm_check"
-#     model: "meta-llama/Llama-Guard-3-1b"
-#     on_fail: "allow" #if want the unsure also view as unsafe then change this to faule
-#     #currently we set the unsure as safety
+# config/rails.yml (推荐的混合方案)
 
 input_rails:
-  - name: detect_user_intent
-    description: Detect user intent and classify risky inputs
-    module: guardrails.builtins.intent_detection
-    config:
-      intents:
-        - ask for technical details of an AMD product
-        - query the price of a specific product
-        - control a robot arm to move
-        - get the latest company news
+  # 规则 1: 使用 Regex (精确匹配) 来捕获敏感的技术问题
+  # 这是最可靠的方法，可以避免假阳性和假阴性
+  - name: block_sensitive_tech_questions
+    type: "regex"  # <-- 注意类型是 "regex"
+    description: Block micro-architecture or sensitive AMD topics on input
+    pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+    on_fail: "block" # 这会立即在输入端阻止它
+
+  # 规则 2: 使用 IntentDetectionRule (向量库) 来捕获其他意图
+  - name: detect_other_intents
+    type: "intent_detection" # <-- 注意类型是 "intent_detection"
+    description: Detects other non-technical, high-level user intents
+    intents:
+      # --- 这里放上向量库擅长识别的、语义不同的意图 ---
+      - "control a robot arm to move"
+      - "get the latest company news"
+      - "query the price of a specific product"
+      - "ask about job openings"
+      - "request technical support for a crashing computer"
+      - "ask for the company's stock price"
+      - "ask for a joke or fun fact"
 
 output_rails:
+  # (保持不变, 作为双重保险)
   - name: block_sensitive_amd_info
-    description: Block micro-architecture or sensitive AMD topics
-    module: guardrails.builtins.regex
-    config:
-      pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
-      on_fail: filter  # blocks matched text safely
+    type: "regex"
+    pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+    on_fail: "block"
 
   - name: llama_semantic_guard
-    description: Analyze output for safety using Llama Guard
-    module: guardrails.builtins.llm_check
-    config:
-      model: "meta-llama/Llama-Guard-3-1b"
-      on_fail: allow  # or 'allow' if you want soft fail
+    type: "llm_check"
+    model: "meta-llama/Llama-Guard-3-1b"
+    on_fail: "allow"
