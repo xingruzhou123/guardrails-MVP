@@ -1,30 +1,44 @@
-# config/rails.yml (推荐的混合方案)
+# config/rails.yml
 
 input_rails:
-  # 规则 1: 使用 Regex (精确匹配) 来捕获敏感的技术问题
-  # 这是最可靠的方法，可以避免假阳性和假阴性
-  - name: block_sensitive_tech_questions
-    type: "regex"  # <-- 注意类型是 "regex"
-    description: Block micro-architecture or sensitive AMD topics on input
-    pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
-    on_fail: "block" # 这会立即在输入端阻止它
+  # --- LAYER 1: The Gatekeeper ---
+  # This rule runs first. It uses a precise Regex to immediately block any
+  # input that contains known sensitive technical terms.
+  - name: block_sensitive_tech_input
+    type: "regex"
+    pattern: "(?i)(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
+    on_fail: "block"
 
-  # 规则 2: 使用 IntentDetectionRule (向量库) 来捕获其他意图
-  - name: detect_other_intents
-    type: "intent_detection" # <-- 注意类型是 "intent_detection"
-    description: Detects other non-technical, high-level user intents
+  # --- LAYER 2: The Intent Classifier ---
+  # If the input is not blocked by the gatekeeper, this rule then checks
+  # for helpful, actionable intents.
+  - name: llm_intent_classifier
+    type: "llm_classifier"
+    description: "Detects user intents and extracts entities using an LLM."
+    top_k: 5
     intents:
-      # --- 这里放上向量库擅长识别的、语义不同的意图 ---
-      - "control a robot arm to move"
-      - "get the latest company news"
-      - "query the price of a specific product"
-      - "ask about job openings"
-      - "request technical support for a crashing computer"
-      - "ask for the company's stock price"
-      - "ask for a joke or fun fact"
+      - name: "query_product_price"
+        description: "User is asking about the price, cost, or availability of a specific product."
+        entities:
+          product_name: "The specific product the user is asking about."
+        examples:
+          - "How much is the Ryzen 9 processor?"
+          - "What's the price for a Zen 4 CPU?"
+          - "Tell me the cost of the new graphics card."
+
+      - name: "control_robot_arm"
+        description: "User is giving a command to a physical or simulated robot arm."
+        entities:
+          action: "The verb describing the action (e.g., 'pick up', 'move', 'grab')."
+          target_object: "The noun or object the action is directed at (e.g., 'red block', 'blue sphere')."
+        examples:
+          - "Command the robot arm to pick up the red block."
+          - "Use the arm to move the blue sphere."
 
 output_rails:
-  # (保持不变, 作为双重保险)
+  # --- LAYER 3: The Final Safety Net ---
+  # As a final protection, this rule checks the main LLM's output,
+  # in case a sensitive topic was phrased in a way that bypassed the input rails.
   - name: block_sensitive_amd_info
     type: "regex"
     pattern: "(?i)(AMD|Ryzen|Zen\\s*\\d+).*(branch\\s*predict(or|ion)|cache|micro[- ]?arch|pipeline|PBT|BTB|prediction\\s*table)"
@@ -34,3 +48,4 @@ output_rails:
     type: "llm_check"
     model: "meta-llama/Llama-Guard-3-1b"
     on_fail: "allow"
+

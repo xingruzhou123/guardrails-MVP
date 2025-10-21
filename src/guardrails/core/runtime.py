@@ -1,18 +1,11 @@
 # src/guardrails/core/runtime.py
-
+import inspect
 from typing import Any, AsyncIterator, Dict, List
 
-# Using absolute imports for robustness
 from guardrails.core.config_types import RailsConfig
 from guardrails.llms.base import BaseLLM
 from guardrails.rules.base import BaseOutputRule, OutputRuleResult
-
-
-def handle_action_placeholder(intent: str, context: dict):
-    """
-    Placeholder function to simulate dispatching an intent to an action module.
-    """
-    return f"(Action module response: Intent '{intent}' was detected and would be handled here.)"
+from guardrails.actions import action_handler
 
 
 class SimpleRuntime:
@@ -33,6 +26,14 @@ class SimpleRuntime:
         self.input_rules = input_rules or []
         self.output_rules = output_rules or []
 
+        # Manually register the available actions. In a real application, this
+        # might be done through a more dynamic plugin system.
+        self.action_registry = {
+            "query_product_price": action_handler.handle_price_query,
+            "control_robot_arm": action_handler.handle_robot_command,
+            # Add other action handlers here
+        }
+
     async def run_once(
         self, messages: List[Dict[str, str]], context: Dict[str, Any]
     ) -> str:
@@ -41,20 +42,37 @@ class SimpleRuntime:
         """
         latest_user_message = messages[-1]["content"]
 
-        # 1. Run input rails first to detect user intent
+        # 1. Run input rails
         for rule in self.input_rules:
-            result = rule.apply(latest_user_message, context)
+            # --- THIS IS THE CRITICAL FIX ---
+            # Check if the rule's apply method is async before awaiting
+            if inspect.iscoroutinefunction(rule.apply):
+                result = await rule.apply(latest_user_message, context)
+            else:
+                result = rule.apply(latest_user_message, context)
+            # --- END FIX ---
 
-            print(
-                f"[debug] Intent Detection Result: action={result.action}, reason='{result.reason}'"
-            )
+            if result.reason == "llm_intent_classifier":
+                intent = result.extra_info.get("intent", "none")
+                entities = result.extra_info.get("entities", {})
+                print(
+                    f"[debug] LLM Classifier Result: Intent='{intent}', Entities={entities}"
+                )
 
             if result.action == "dispatch":
-                return handle_action_placeholder(result.reason, context)
+                intent_name = result.extra_info.get("intent")
+                action_to_run = self.action_registry.get(intent_name)
+
+                if action_to_run:
+                    entities = result.extra_info.get("entities", {})
+                    return action_to_run(entities)
+                else:
+                    return f"Error: Action for intent '{intent_name}' not found."
+
             elif result.action == "block":
                 return f"Input blocked: {result.reason}"
 
-        # 2. If no intent was dispatched, proceed to the main LLM
+        # 2. If no action was dispatched, proceed to the main LLM
         output = ""
         if hasattr(self.llm, "acomplete"):
             output = await self.llm.acomplete(messages)
@@ -77,21 +95,35 @@ class SimpleRuntime:
         """
         Processes a streaming request, now with input rail checks.
         """
-        # --- CRITICAL FIX: Add input rail logic to the streaming path ---
         latest_user_message = messages[-1]["content"]
         for rule in self.input_rules:
-            result = rule.apply(latest_user_message, context)
+            # --- THIS IS THE CRITICAL FIX (Applied here as well) ---
+            if inspect.iscoroutinefunction(rule.apply):
+                result = await rule.apply(latest_user_message, context)
+            else:
+                result = rule.apply(latest_user_message, context)
+            # --- END FIX ---
 
-            print(
-                f"[debug] Intent Detection Result: action={result.action}, reason='{result.reason}'"
-            )
+            if result.reason == "llm_intent_classifier":
+                intent = result.extra_info.get("intent", "none")
+                entities = result.extra_info.get("entities", {})
+                print(
+                    f"[debug] LLM Classifier Result: Intent='{intent}', Entities={entities}"
+                )
 
             if result.action == "dispatch":
-                yield handle_action_placeholder(result.reason, context)
-                return  # Stop the stream
+                intent_name = result.extra_info.get("intent")
+                action_to_run = self.action_registry.get(intent_name)
+                if action_to_run:
+                    entities = result.extra_info.get("entities", {})
+                    yield action_to_run(entities)
+                else:
+                    yield f"Error: Action for intent '{intent_name}' not found."
+                return
+
             elif result.action == "block":
                 yield f"Input blocked: {result.reason}"
-                return  # Stop the stream
+                return
 
         # If input is allowed, proceed with the original streaming logic
         last_sent = ""
@@ -104,7 +136,9 @@ class SimpleRuntime:
 
             for rule in self.output_rules:
                 if not hasattr(rule, "classify"):
-                    rr = rule.apply(full_text, context)
+                    rr = rule.apply(
+                        full_text, context
+                    )  # This is not async, so we don't await
                     if rr.action == "block":
                         yield f" Blocked by {rr.reason}"
                         return
@@ -116,10 +150,11 @@ class SimpleRuntime:
                 for rule in self.output_rules:
                     if hasattr(rule, "classify"):
                         verdict = await rule.classify(full_text)
+                        allow_on_unsure = getattr(rule, "allow_on_unsure", False)
                         if verdict == "UNSAFE" or (
-                            verdict == "UNSURE" and not rule.allow_on_unsure
+                            verdict == "UNSURE" and not allow_on_unsure
                         ):
-                            yield f"Blocked by {rule.name} ({verdict})"
+                            yield f" Blocked by {rule.name} ({verdict})"
                             return
                 last_llm_check = len(full_text)
 
@@ -128,7 +163,6 @@ class SimpleRuntime:
                 yield delta
                 last_sent = full_text
 
-    # ... (_apply_output_rails_async method remains the same) ...
     async def _apply_output_rails_async(
         self, text: str, context: dict
     ) -> List[OutputRuleResult]:
@@ -137,8 +171,10 @@ class SimpleRuntime:
         """
         results = []
         for rule in self.output_rules:
-            if hasattr(rule, "classify"):
+            # This logic also needs to handle sync/async
+            if hasattr(rule, "classify") and inspect.iscoroutinefunction(rule.classify):
                 verdict = await rule.classify(text)
+                allow_on_unsure = getattr(rule, "allow_on_unsure", False)
                 if verdict == "UNSAFE":
                     results.append(
                         OutputRuleResult(
@@ -147,7 +183,7 @@ class SimpleRuntime:
                             text=text,
                         )
                     )
-                elif verdict == "UNSURE" and not rule.allow_on_unsure:
+                elif verdict == "UNSURE" and not allow_on_unsure:
                     results.append(
                         OutputRuleResult(
                             action="block",
@@ -158,6 +194,10 @@ class SimpleRuntime:
                 else:
                     results.append(OutputRuleResult(action="allow", text=text))
             else:
-                results.append(rule.apply(text, context))
+                # Standard synchronous apply method
+                if inspect.iscoroutinefunction(rule.apply):
+                    results.append(await rule.apply(text, context))
+                else:
+                    results.append(rule.apply(text, context))
 
         return results
